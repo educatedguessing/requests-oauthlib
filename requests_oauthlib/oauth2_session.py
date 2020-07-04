@@ -45,8 +45,7 @@ class OAuth2Session(requests.Session):
         redirect_uri=None,
         token=None,
         state=None,
-        token_updater=None,
-        **kwargs
+        token_updater=None
     ):
         """Construct a new OAuth 2 client session.
 
@@ -72,9 +71,8 @@ class OAuth2Session(requests.Session):
                         set a TokenUpdated warning will be raised when a token
                         has been refreshed. This warning will carry the token
                         in its token argument.
-        :param kwargs: Arguments to pass to the Session constructor.
         """
-        super(OAuth2Session, self).__init__(**kwargs)
+        super(OAuth2Session, self).__init__()
         self._client = client or WebApplicationClient(client_id, token=token)
         self.token = token or {}
         self.scope = scope
@@ -237,8 +235,6 @@ class OAuth2Session(requests.Session):
         :param kwargs: Extra parameters to include in the token request.
         :return: A token dict
         """
-        if not is_secure_transport(token_url):
-            raise InsecureTransportError()
 
         if not code and authorization_response:
             self._client.parse_request_uri_response(
@@ -409,9 +405,6 @@ class OAuth2Session(requests.Session):
         if not token_url:
             raise ValueError("No token endpoint set for auto_refresh.")
 
-        if not is_secure_transport(token_url):
-            raise InsecureTransportError()
-
         refresh_token = refresh_token or self.token.get("refresh_token")
 
         log.debug(
@@ -436,9 +429,9 @@ class OAuth2Session(requests.Session):
             timeout=timeout,
             headers=headers,
             verify=verify,
-            withhold_token=True,
             proxies=proxies,
         )
+
         log.debug("Request to refresh token completed with status %s.", r.status_code)
         log.debug("Response headers were %s and content %s.", r.headers, r.text)
         log.debug(
@@ -455,21 +448,25 @@ class OAuth2Session(requests.Session):
             self.token["refresh_token"] = refresh_token
         return self.token
 
-    def request(
-        self,
-        method,
-        url,
-        data=None,
-        headers=None,
-        withhold_token=False,
-        client_id=None,
-        client_secret=None,
-        **kwargs
-    ):
-        """Intercept all requests and add the OAuth 2 token if present."""
-        if not is_secure_transport(url):
+    def send(self, request, **kwargs):
+
+        if not is_secure_transport(request.url):
             raise InsecureTransportError()
-        if self.token and not withhold_token:
+
+        return super(OAuth2Session,self).send(request, **kwargs)
+
+    def prepare_request(self, request, client_id=None, client_secret=None):
+
+        """Intercept all requests and add the OAuth 2 token if present."""
+
+        # unfold request
+        method = request.method
+        url = request.url
+        headers = request.headers
+        data = request.data
+        auth = request.auth
+
+        if self.token:
             log.debug(
                 "Invoking %d protected resource request hooks.",
                 len(self.compliance_hook["protected_request"]),
@@ -485,22 +482,22 @@ class OAuth2Session(requests.Session):
                 )
             # Attempt to retrieve and save new access token if expired
             except TokenExpiredError:
+
+                # keep refresh token to for possible refresh
+                refresh_token = self.token.get("refresh_token", None)
+
+                # access token is invalid; avoid recursion
+                self.token = {}
+
                 if self.auto_refresh_url:
+
                     log.debug(
                         "Auto refresh is set, attempting to refresh at %s.",
                         self.auto_refresh_url,
                     )
 
-                    # We mustn't pass auth twice.
-                    auth = kwargs.pop("auth", None)
-                    if client_id and client_secret and (auth is None):
-                        log.debug(
-                            'Encoding client_id "%s" with client_secret as Basic auth credentials.',
-                            client_id,
-                        )
-                        auth = requests.auth.HTTPBasicAuth(client_id, client_secret)
                     token = self.refresh_token(
-                        self.auto_refresh_url, auth=auth, **kwargs
+                        self.auto_refresh_url, refresh_token=refresh_token, auth=auth
                     )
                     if self.token_updater:
                         log.debug(
@@ -515,11 +512,40 @@ class OAuth2Session(requests.Session):
                 else:
                     raise
 
+        request.method = method
+        request.url = url
+        request.headers = headers
+        request.data = data
+
         log.debug("Requesting url %s using method %s.", url, method)
         log.debug("Supplying headers %s and data %s", headers, data)
+
+        return super(OAuth2Session, self).prepare_request(request)
+
+    def request(
+        self,
+        method,
+        url,
+        data=None,
+        headers=None,
+        client_id=None,
+        client_secret=None,
+        **kwargs
+    ):
+        """Intercept all requests and add auth if needed."""
+
+        auth = kwargs.pop("auth", None)
+
+        if client_id and client_secret and (auth is None):
+            log.debug(
+                'Encoding client_id "%s" with client_secret as Basic auth credentials.',
+                client_id,
+            )
+            auth = requests.auth.HTTPBasicAuth(client_id, client_secret)
+
         log.debug("Passing through key word arguments %s.", kwargs)
         return super(OAuth2Session, self).request(
-            method, url, headers=headers, data=data, **kwargs
+            method, url, headers=headers, data=data, auth=auth, **kwargs
         )
 
     def register_compliance_hook(self, hook_type, hook):
